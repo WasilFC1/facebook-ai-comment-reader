@@ -164,3 +164,237 @@ if st.session_state.get('results'):
     st.download_button('Download interpretations (CSV)', buffer.getvalue().encode('utf-8-sig'),
                        file_name='ai_comment_interpretations.csv', mime='text/csv')
     st.info('Review the AI results manually. This version does not approve or place orders.')
+
+
+# --------------------------------------------------
+# PHASE 1: BASIC SUPPLIER ORDER SUMMARY
+# --------------------------------------------------
+
+def create_supplier_tables(results):
+    supplier_rows = []
+    review_rows = []
+
+    for entry in results:
+        category = str(entry.get("category", "")).lower()
+        comment = str(entry.get("text", ""))
+        customer = str(entry.get("author_name", ""))
+        needs_review = entry.get("needs_review", True)
+
+        # Handle boolean values safely
+        if isinstance(needs_review, str):
+            needs_review = needs_review.strip().lower() != "false"
+
+        if category != "order":
+            continue
+
+        # Parse the AI's item data
+        try:
+            items = entry.get("items", [])
+            if isinstance(items, str):
+                items = json.loads(items)
+            if not isinstance(items, list):
+                raise ValueError("Items must be a list")
+        except (ValueError, TypeError, json.JSONDecodeError):
+            review_rows.append({
+                "Customer": customer,
+                "Comment": comment,
+                "Reason": "Invalid item data"
+            })
+            continue
+
+        if not items:
+            review_rows.append({
+                "Customer": customer,
+                "Comment": comment,
+                "Reason": "No items extracted"
+            })
+            continue
+
+        for item in items:
+            product = str(item.get("product") or "").strip()
+            size = str(item.get("size") or "").strip().upper()
+            colour = str(item.get("colour") or "").strip().lower()
+            quantity = item.get("quantity")
+
+            try:
+                quantity = int(quantity)
+                if quantity < 1:
+                    raise ValueError()
+            except (ValueError, TypeError):
+                quantity = None
+
+            # Unresolved choices must never reach the supplier
+            uncertain_size = any(
+                word in size.lower().split()
+                for word in ["lub", "albo", "czy"]
+            )
+
+            if (
+                needs_review
+                or not product
+                or quantity is None
+                or uncertain_size
+            ):
+                review_rows.append({
+                    "Customer": customer,
+                    "Comment": comment,
+                    "Reason": "Order requires manual review"
+                })
+                continue
+
+            supplier_rows.append({
+                "Product": product,
+                "Size": size,
+                "Colour": colour,
+                "Quantity": quantity,
+                "Customer": customer,
+                "Comment ID": entry.get("id", ""),
+                "Comment Time": entry.get("comment_time", ""),
+                "Comment URL": entry.get("comment_url", ""),
+                "Comment": comment
+                
+            })
+
+    details = pd.DataFrame(
+        supplier_rows,
+        columns=[
+            "Product", "Size", "Colour",
+            "Quantity", "Customer",
+            "Comment ID", "Comment Time",
+            "Comment URL", "Comment"
+        ]
+    )
+
+    if details.empty:
+        summary = pd.DataFrame(
+            columns=["Product", "Size", "Colour", "Quantity"]
+        )
+    else:
+        summary = (
+            details.groupby(
+                ["Product", "Size", "Colour"],
+                as_index=False
+            )["Quantity"]
+            .sum()
+            .sort_values(["Product", "Size", "Colour"])
+        )
+
+    review = pd.DataFrame(
+        review_rows,
+        columns=["Customer", "Comment", "Reason"]
+    )
+
+    return summary, details, review
+
+
+if st.session_state.get("results"):
+    st.divider()
+    st.header("📦 Supplier order summary")
+
+    summary, details, review = create_supplier_tables(
+        st.session_state["results"]
+    )
+
+        
+    # Basic customer summary
+    # Names are temporary grouping keys, not verified identities.
+
+    if not details.empty:
+        customer_summary = (
+            details.groupby("Customer", as_index=False)
+            .agg(
+                Total_Units=("Quantity", "sum"),
+                Order_Lines=("Quantity", "size"),
+                Sizes=("Size", lambda x: ", ".join(
+                    sorted(set(x.dropna().astype(str)))
+                )),
+                Comments=("Comment", lambda x: " | ".join(
+                    x.astype(str)
+                ))
+            )
+            .sort_values("Customer")
+        )
+    else:
+        customer_summary = pd.DataFrame(
+            columns=[
+                "Customer", "Total_Units",
+                "Order_Lines", "Sizes", "Comments"
+            ]
+        )
+
+    st.subheader("👥 Customer summary")
+    st.caption(
+        "Temporarily grouped by customer name. "
+        "People with identical names cannot yet be distinguished."
+    )
+    st.dataframe(
+        customer_summary,
+        use_container_width=True,
+        hide_index=True
+    )
+
+
+    col1, col2, col3 = st.columns(3)
+
+    col1.metric("Total units", int(summary["Quantity"].sum()))
+    col2.metric("Order lines", len(details))
+    col3.metric("Items needing review", len(review))
+
+    st.subheader("Grouped supplier orders")
+    st.dataframe(summary, use_container_width=True, hide_index=True)
+
+    if not review.empty:
+        st.warning(
+            "Some orders need review and are excluded "
+            "from supplier totals."
+        )
+        with st.expander("View orders needing review"):
+            st.dataframe(
+                review,
+                use_container_width=True,
+                hide_index=True
+            )
+
+    # Create an Excel workbook in memory
+    
+    # Create an Excel workbook in memory
+    excel_buffer = io.BytesIO()
+
+    with pd.ExcelWriter(
+        excel_buffer,
+        engine="openpyxl"
+    ) as writer:
+
+        summary.to_excel(
+            writer,
+            sheet_name="Supplier Summary",
+            index=False
+        )
+
+        details.to_excel(
+            writer,
+            sheet_name="Customer Orders",
+            index=False
+        )
+
+        review.to_excel(
+            writer,
+            sheet_name="Needs Review",
+            index=False
+        )
+
+        customer_summary.to_excel(
+            writer,
+            sheet_name="Customer Summary",
+            index=False
+        )
+
+    st.download_button(
+        label="📥 Download supplier Excel",
+        data=excel_buffer.getvalue(),
+        file_name="supplier_orders.xlsx",
+        mime=(
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet"
+        )
+    )
